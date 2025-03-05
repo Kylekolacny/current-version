@@ -1,0 +1,377 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <random> 
+#include <cmath>
+#include <vector>
+// Prevent conflicts between Qt and LibTorch
+#undef slots
+#include <torch/torch.h>
+#include <torch/script.h>
+#define slots Q_SLOTS
+
+// Enable console output flushing
+#define DEBUG_PRINT(x) do { std::cout << x << std::endl; std::cout.flush(); } while(0)
+
+class ConvReluBnImpl : public torch::nn::Module {
+public:
+    ConvReluBnImpl(int input_channel = 3, int output_channel = 64, int kernel_size = 3);
+    torch::Tensor forward(torch::Tensor x);
+private:
+    // Declare layers
+    torch::nn::Conv2d conv{ nullptr };
+    torch::nn::BatchNorm2d bn{ nullptr };
+};
+TORCH_MODULE(ConvReluBn);
+
+ConvReluBnImpl::ConvReluBnImpl(int input_channel, int output_channel, int kernel_size) {
+    conv = register_module("conv", torch::nn::Conv2d(
+        torch::nn::Conv2dOptions(input_channel, output_channel, kernel_size).padding(1)));
+    bn = register_module("bn", torch::nn::BatchNorm2d(output_channel));
+}
+
+torch::Tensor ConvReluBnImpl::forward(torch::Tensor x) {
+    x = torch::relu(conv->forward(x));
+    x = bn(x);
+    return x;
+}
+
+class Environment {
+public:
+    Environment(int width = 100, int height = 100)
+        : width_(width), height_(height),
+        agent_x_(width / 2), agent_y_(height / 2) {
+
+        // Use a proper random number generator
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> distrib_w(0, width - 1);
+        std::uniform_int_distribution<> distrib_h(0, height - 1);
+
+        goal_x_ = distrib_w(gen);
+        goal_y_ = distrib_h(gen);
+
+        DEBUG_PRINT("Environment created: Agent at (" << agent_x_ << ", " << agent_y_ <<
+            "), goal at (" << goal_x_ << ", " << goal_y_ << ")");
+    }
+
+    // Compute state: distance and angle to goal
+    torch::Tensor getState() {
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+
+        // Distance to goal
+        double distance = std::sqrt(dx * dx + dy * dy);
+
+        // Angle to goal
+        double angle = std::atan2(dy, dx);
+
+        // Explicitly create a tensor with requires_grad
+        return torch::tensor({ distance, angle },
+            torch::TensorOptions().dtype(torch::kFloat32).requires_grad(true));
+    }
+
+    // Apply agent's action and return reward
+    float step(torch::Tensor action) {
+        try {
+            // Verify tensor is accessible and detach if needed
+            if (!action.defined() || action.numel() < 2) {
+                DEBUG_PRINT("Warning: Invalid action tensor");
+                return -100.0f;  // Penalty for invalid action
+            }
+
+            // Detach tensor to prevent gradient issues
+            action = action.detach();
+
+            // Decode action: [move_x, move_y]
+            float move_x = action[0].item<float>();
+            float move_y = action[1].item<float>();
+
+            // Update agent position
+            agent_x_ += move_x * 5;
+            agent_y_ += move_y * 5;
+
+            // Bound check
+            agent_x_ = std::max(0.0f, std::min(static_cast<float>(width_), agent_x_));
+            agent_y_ = std::max(0.0f, std::min(static_cast<float>(height_), agent_y_));
+
+            // Compute distance to goal
+            double dx = goal_x_ - agent_x_;
+            double dy = goal_y_ - agent_y_;
+            double distance = std::sqrt(dx * dx + dy * dy);
+
+            // Reward is negative distance (closer = better)
+            return -distance;
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in step: " << e.what());
+            return -100.0f;  // Return penalty on error
+        }
+    }
+
+    // Check if goal is reached
+    bool isGoalReached() {
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        return std::sqrt(dx * dx + dy * dy) < 5.0;
+    }
+
+private:
+    int width_, height_;
+    float agent_x_, agent_y_;
+    float goal_x_, goal_y_;
+};
+
+// Neural Network Agent
+class AgentNet : public torch::nn::Module {
+public:
+    AgentNet() {
+        // Input: [distance, angle]
+        // Output: [move_x, move_y]
+        try {
+            fc1 = register_module("fc1", torch::nn::Linear(2, 16));
+            fc2 = register_module("fc2", torch::nn::Linear(16, 16));
+            fc3 = register_module("fc3", torch::nn::Linear(16, 2));
+            DEBUG_PRINT("AgentNet initialized successfully");
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Error initializing AgentNet: " << e.what());
+        }
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        try {
+            // Ensure input tensor requires gradients
+            if (!x.requires_grad()) {
+                x = x.clone().requires_grad_(true);
+            }
+
+            x = torch::relu(fc1->forward(x));
+            x = torch::relu(fc2->forward(x));
+            x = fc3->forward(x);
+            return x;
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in forward pass: " << e.what());
+            // Return a default action in case of error
+            return torch::zeros({ 2 }, torch::TensorOptions().requires_grad(true));
+        }
+    }
+
+private:
+    torch::nn::Linear fc1{ nullptr }, fc2{ nullptr }, fc3{ nullptr };
+};
+
+// Simple Q-Learning Agent
+class QLearningAgent {
+public:
+    QLearningAgent(int state_dim, int action_dim) {
+        try {
+            network = std::make_shared<AgentNet>();
+            target_network = std::make_shared<AgentNet>();
+            optimizer = std::make_unique<torch::optim::Adam>(
+                network->parameters(), torch::optim::AdamOptions(0.001));
+
+            // Initial synchronization of networks
+            copyNetworkParameters();
+
+            DEBUG_PRINT("QLearningAgent initialized successfully");
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Error initializing QLearningAgent: " << e.what());
+        }
+    }
+
+    torch::Tensor selectAction(torch::Tensor state, float epsilon) {
+        try {
+            // Ensure state requires gradients
+            if (!state.requires_grad()) {
+                state = state.clone().requires_grad_(true);
+            }
+
+            // Epsilon-greedy action selection
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_real_distribution<> dis(0.0, 1.0);
+
+            if (dis(gen) < epsilon) {
+                // Random action between -1 and 1
+                return torch::rand({ 2 }, torch::TensorOptions().requires_grad(true)) * 2.0 - 1.0;
+            }
+
+            // Ensure state is properly shaped for network
+            torch::NoGradGuard no_grad;
+            auto action = network->forward(state);
+
+            // Clamp actions to be within valid range
+            action = torch::clamp(action, -1.0, 1.0);
+            return action;
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in selectAction: " << e.what());
+            // Return a default action in case of error
+            return torch::zeros({ 2 }, torch::TensorOptions().requires_grad(true));
+        }
+    }
+
+    void train(torch::Tensor state, torch::Tensor action, float reward, torch::Tensor next_state) {
+        try {
+            // Ensure tensors require gradients
+            if (!state.requires_grad())
+                state = state.clone().requires_grad_(true);
+            if (!next_state.requires_grad())
+                next_state = next_state.clone().requires_grad_(true);
+
+            // Create a differentiable reward tensor
+            torch::Tensor reward_tensor = torch::tensor(reward,
+                torch::TensorOptions().dtype(torch::kFloat32).requires_grad(true));
+
+            // Compute target Q value with gradient tracking
+            torch::Tensor target_q = reward_tensor +
+                0.99 * target_network->forward(next_state).max().to(torch::kFloat32);
+
+            // Current Q values from the network
+            torch::Tensor current_q = network->forward(state);
+
+            // Ensure target_q is the same shape as current_q for loss computation
+            target_q = target_q.expand_as(current_q);
+
+            // Compute loss with requires_grad
+            torch::Tensor loss = torch::mse_loss(current_q, target_q);
+
+            // Zero gradients, backpropagate, and optimize
+            optimizer->zero_grad();
+            loss.backward();
+            optimizer->step();
+
+            DEBUG_PRINT("Training step completed. Loss: " << loss.item<float>());
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in train: " << e.what());
+        }
+    }
+
+    void updateTargetNetwork() {
+        try {
+            copyNetworkParameters();
+            DEBUG_PRINT("Target network updated");
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in updateTargetNetwork: " << e.what());
+        }
+    }
+
+private:
+    std::shared_ptr<AgentNet> network;
+    std::shared_ptr<AgentNet> target_network;
+    std::unique_ptr<torch::optim::Adam> optimizer;
+
+    void copyNetworkParameters() {
+        auto params = network->named_parameters();
+        auto buffers = network->named_buffers();
+
+        auto target_params = target_network->named_parameters();
+        auto target_buffers = target_network->named_buffers();
+
+        for (auto& val : params) {
+            auto name = val.key();
+            auto* target = target_params.find(name);
+            if (target != nullptr) {
+                target->copy_(val.value());
+            }
+        }
+
+        for (auto& val : buffers) {
+            auto name = val.key();
+            auto* target = target_buffers.find(name);
+            if (target != nullptr) {
+                target->copy_(val.value());
+            }
+        }
+    }
+};
+
+int main() {
+    try {
+        DEBUG_PRINT("Starting program...");
+
+        // Set random seed
+        std::random_device rd;
+        std::srand(rd());
+
+        // Create environment and agent
+        DEBUG_PRINT("Creating environment and agent...");
+
+        try {
+            Environment env;
+            QLearningAgent agent(2, 2);  // 2D state, 2D action space
+
+            // Training loop
+            int num_episodes = 100;  // Reduced from 1000 for testing
+            float epsilon = 1.0;  // Exploration rate
+
+            for (int episode = 0; episode < num_episodes; ++episode) {
+                // Reset environment
+                Environment new_env;
+                env = new_env;
+
+                // Initial state with requires_grad
+                torch::Tensor state = env.getState();
+
+                float total_reward = 0;
+                int steps = 0;
+
+                while (!env.isGoalReached() && steps < 100) {  // Reduced from 200 for testing
+                    // Select and apply action
+                    torch::Tensor action = agent.selectAction(state, epsilon);
+                    float reward = env.step(action);
+
+                    // Get next state with requires_grad
+                    torch::Tensor next_state = env.getState();
+
+                    // Train agent
+                    agent.train(state, action, reward, next_state);
+
+                    // Update state
+                    state = next_state;
+                    total_reward += reward;
+                    steps++;
+                }
+
+                // Decay epsilon
+                epsilon = std::max(0.01f, epsilon * 0.99f);
+
+                // Periodically update target network
+                if (episode % 10 == 0) {
+                    agent.updateTargetNetwork();
+                }
+
+                // Print progress (now with buffer flushing)
+                DEBUG_PRINT("Episode " << episode
+                    << ": Steps=" << steps
+                    << ", Total Reward=" << total_reward
+                    << ", Epsilon=" << epsilon);
+            }
+        }
+        catch (const c10::Error& e) {
+            DEBUG_PRINT("LibTorch error: " << e.what());
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Standard exception: " << e.what());
+        }
+        catch (...) {
+            DEBUG_PRINT("Unknown error occurred");
+        }
+
+        DEBUG_PRINT("Program completed successfully");
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
+    }
+    catch (...) {
+        std::cerr << "Unknown fatal error occurred" << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
