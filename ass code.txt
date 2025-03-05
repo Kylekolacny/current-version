@@ -1,0 +1,762 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <random> 
+#include <cmath>
+#include <vector>
+#include <deque>
+#include "replay_buffer.h"
+#include <exception>
+#undef slots
+#include <torch/torch.h>
+#include <torch/script.h>
+#define slots Q_SLOTS
+
+#define DEBUG_PRINT(x) do { std::cout << x << std::endl; std::cout.flush(); } while(0)
+
+class ConvReluBnImpl : public torch::nn::Module {
+public:
+    ConvReluBnImpl(int input_channel = 3, int output_channel = 64, int kernel_size = 3);
+    torch::Tensor forward(torch::Tensor x); // Remove 'override' here
+private:
+    torch::nn::Conv2d conv{ nullptr };
+    torch::nn::BatchNorm2d bn{ nullptr };
+};
+TORCH_MODULE(ConvReluBn);
+
+ConvReluBnImpl::ConvReluBnImpl(int input_channel, int output_channel, int kernel_size) {
+    conv = register_module("conv", torch::nn::Conv2d(
+        torch::nn::Conv2dOptions(input_channel, output_channel, kernel_size).padding(1)));
+    bn = register_module("bn", torch::nn::BatchNorm2d(output_channel));
+}
+
+torch::Tensor ConvReluBnImpl::forward(torch::Tensor x) {
+    x = torch::relu(conv->forward(x));
+    x = bn(x);
+    return x;
+}
+
+class Environment {
+public:
+    void render(const std::vector<cv::Point>& path = {}, const std::string& window_name = "RL Environment") const {
+        const int scale = 5;
+        const int width = width_ * scale;
+        const int height = height_ * scale;
+
+        cv::Mat image = cv::Mat::ones(height, width, CV_8UC3) * 255;
+
+        if (!path.empty()) {
+            std::vector<cv::Point> scaled_path;
+            for (const auto& pt : path) {
+                scaled_path.push_back(cv::Point(pt.x * scale, pt.y * scale));
+            }
+            cv::polylines(image, std::vector<std::vector<cv::Point>>{scaled_path}, false, cv::Scalar(0, 0, 255), 2);
+        }
+
+        cv::circle(image,
+            cv::Point(static_cast<int>(goal_x_ * scale), static_cast<int>(goal_y_ * scale)),
+            10, cv::Scalar(0, 255, 0), cv::FILLED);
+
+        cv::circle(image,
+            cv::Point(static_cast<int>(agent_x_ * scale), static_cast<int>(agent_y_ * scale)),
+            10, cv::Scalar(255, 0, 0), cv::FILLED);
+
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        double distance = std::sqrt(dx * dx + dy * dy);
+        cv::putText(image, "Distance: " + std::to_string(distance),
+            cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+
+        cv::imshow(window_name, image);
+        cv::waitKey(10);
+    }
+
+    float getAgentX() const { return agent_x_; }
+    float getAgentY() const { return agent_y_; }
+    float getGoalX() const { return goal_x_; }
+    float getGoalY() const { return goal_y_; }
+
+    Environment(int width = 100, int height = 100, float difficulty = 1.0)
+        : width_(width), height_(height),
+        agent_x_(width / 2), agent_y_(height / 2) {
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> distrib_w(0, width - 1);
+        std::uniform_int_distribution<> distrib_h(0, height - 1);
+
+        do {
+            goal_x_ = distrib_w(gen);
+            goal_y_ = distrib_h(gen);
+
+            double dx = goal_x_ - agent_x_;
+            double dy = goal_y_ - agent_y_;
+            double distance = std::sqrt(dx * dx + dy * dy);
+
+            // The difficulty parameter controls how far the goal can be
+            double min_distance = 0.1 * std::sqrt(width * width + height * height);
+            double max_distance = difficulty * 0.5 * std::sqrt(width * width + height * height);
+
+            if (distance >= min_distance && distance <= max_distance) break;
+
+        } while (true);
+
+        DEBUG_PRINT("Environment created: Agent at (" << agent_x_ << ", " << agent_y_ <<
+            "), goal at (" << goal_x_ << ", " << goal_y_ << ")");
+    }
+
+    torch::Tensor getState() {
+        // Change from 3 elements to 5 elements for enhanced state representation
+        auto state = torch::empty({ 5 }, torch::TensorOptions().dtype(torch::kFloat32));
+
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        double distance = std::sqrt(dx * dx + dy * dy);
+        double angle = std::atan2(dy, dx);
+
+        // Normalized position information for better learning
+        state[0] = distance / std::sqrt(width_ * width_ + height_ * height_); // Normalized distance
+        state[1] = std::sin(angle);
+        state[2] = std::cos(angle);
+        state[3] = agent_x_ / width_;  // Normalized x position
+        state[4] = agent_y_ / height_; // Normalized y position
+
+        return state.detach().requires_grad_(true);
+    }
+
+    float Environment::step(torch::Tensor action) {
+        if (!action.defined() || action.numel() < 2) {
+            DEBUG_PRINT("Warning: Invalid action tensor");
+            return -100.0f;
+        }
+
+        action = action.detach();
+
+        float move_x = action[0].item<float>();
+        float move_y = action[1].item<float>();
+
+        DEBUG_PRINT("Action selected: [" << move_x << ", " << move_y << "]");
+
+        double prev_dx = goal_x_ - agent_x_;
+        double prev_dy = goal_y_ - agent_y_;
+        double prev_distance = std::sqrt(prev_dx * prev_dx + prev_dy * prev_dy);
+        double optimal_angle = std::atan2(prev_dy, prev_dx);  // Optimal direction toward goal
+
+        // Store previous position for corner detection
+        float prev_x = agent_x_;
+        float prev_y = agent_y_;
+
+        // Move agent
+        agent_x_ += move_x * 5;
+        agent_y_ += move_y * 5;
+
+        // Ensure agent stays within bounds
+        agent_x_ = std::max(0.0f, std::min(static_cast<float>(width_), agent_x_));
+        agent_y_ = std::max(0.0f, std::min(static_cast<float>(height_), agent_y_));
+
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        double distance = std::sqrt(dx * dx + dy * dy);
+
+        // Base reward for distance improvement
+        float reward = prev_distance - distance;
+
+        // Goal reached bonus
+        if (distance < 5.0) {
+            reward += 50.0f;  // Large reward for reaching goal
+        }
+        else {
+            // Enhanced directional reward component
+            double action_angle = std::atan2(move_y, move_x);
+            double angle_diff = std::abs(action_angle - optimal_angle);
+            while (angle_diff > M_PI) angle_diff = 2 * M_PI - angle_diff;
+
+            // Strong reward for moving in the correct direction (1.0 when perfect, -1.0 when opposite)
+            float direction_reward = 8.0f * (1.0f - angle_diff / M_PI);
+            reward += direction_reward;
+
+            // Additional reward for distance improvement (not just raw difference)
+            if (distance < prev_distance) {
+                float improvement_ratio = (prev_distance - distance) / prev_distance;
+                reward += improvement_ratio * 10.0f;
+            }
+        }
+
+        // CRUCIAL FIX: Graduated penalty for boundary proximity
+        bool hit_boundary = false;
+        if (agent_x_ == 0 || agent_x_ == width_ || agent_y_ == 0 || agent_y_ == height_) {
+            reward -= 15.0f;  // Increased penalty for actually hitting boundary
+            hit_boundary = true;
+        }
+
+        // Add strong penalty for corner proximity - this directly addresses the corner issue
+        const float corner_penalty_radius = 20.0f;
+        const float corner_penalty_max = 12.0f;
+
+        // Check distance to each corner
+        std::vector<std::pair<float, float>> corners = {
+            {0.0f, 0.0f}, {width_, 0.0f}, {0.0f, height_}, {width_, height_}
+        };
+
+        for (const auto& corner : corners) {
+            float corner_distance = std::sqrt(
+                std::pow(agent_x_ - corner.first, 2) +
+                std::pow(agent_y_ - corner.second, 2)
+            );
+
+            // Apply increasing penalty as agent gets closer to corners
+            if (corner_distance < corner_penalty_radius) {
+                float penalty = corner_penalty_max * (1.0f - corner_distance / corner_penalty_radius);
+                reward -= penalty;
+
+                // Log significant corner proximity
+                if (penalty > corner_penalty_max * 0.7f) {
+                    DEBUG_PRINT("Corner proximity detected! Penalty: " << penalty);
+                }
+            }
+        }
+
+        // Add penalty for inefficient movement (zigzagging)
+        if (steps_history_.size() >= 3) {
+            auto last_pos = steps_history_.back();
+            auto second_last_pos = steps_history_[steps_history_.size() - 2];
+
+            // Calculate angle changes between movements to detect zigzagging
+            float dx1 = agent_x_ - last_pos.first;
+            float dy1 = agent_y_ - last_pos.second;
+            float dx2 = last_pos.first - second_last_pos.first;
+            float dy2 = last_pos.second - second_last_pos.second;
+
+            if (std::abs(dx1) > 0.1f || std::abs(dy1) > 0.1f) {
+                if (std::abs(dx2) > 0.1f || std::abs(dy2) > 0.1f) {
+                    float dot_product = dx1 * dx2 + dy1 * dy2;
+                    float mag1 = std::sqrt(dx1 * dx1 + dy1 * dy1);
+                    float mag2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
+
+                    if (mag1 > 0 && mag2 > 0) {
+                        float cos_angle = dot_product / (mag1 * mag2);
+                        cos_angle = std::max(-1.0f, std::min(1.0f, cos_angle)); // Clamp to [-1,1]
+
+                        // Penalize sharp turns (large angle changes indicate inefficiency)
+                        if (cos_angle < 0) {
+                            reward -= 3.0f * (1.0f + cos_angle);  // Penalty increases with angle
+                        }
+                    }
+                }
+            }
+        }
+
+        // Store position for movement history
+        steps_history_.push_back({ agent_x_, agent_y_ });
+        if (steps_history_.size() > 5) {
+            steps_history_.erase(steps_history_.begin());
+        }
+
+        DEBUG_PRINT("Step: reward=" << reward << (hit_boundary ? " (hit boundary)" : ""));
+        return reward;
+    }
+
+    bool isGoalReached() {
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        return std::sqrt(dx * dx + dy * dy) < 5.0;
+    }
+
+private:
+
+	std::vector<std::pair<float, float>> steps_history_;
+    int width_, height_;
+    float agent_x_, agent_y_;
+    float goal_x_, goal_y_;
+};
+
+class DuelingAgentNetImpl : public torch::nn::Module {
+public:
+    DuelingAgentNetImpl(int input_dim = 5, int output_dim = 2) { // Updated for new state dimensions
+        // Define the network layers with better initialization
+        fc1 = register_module("fc1", torch::nn::Linear(input_dim, 256));
+        fc2 = register_module("fc2", torch::nn::Linear(256, 256));
+        fc3 = register_module("fc3", torch::nn::Linear(256, 128));
+        value_stream = register_module("value_stream", torch::nn::Linear(128, 1));
+        advantage_stream = register_module("advantage_stream", torch::nn::Linear(128, output_dim));
+
+        // Xavier initialization for better gradient flow
+        torch::nn::init::xavier_uniform_(fc1->weight);
+        torch::nn::init::xavier_uniform_(fc2->weight);
+        torch::nn::init::xavier_uniform_(fc3->weight);
+        torch::nn::init::xavier_uniform_(value_stream->weight);
+        torch::nn::init::xavier_uniform_(advantage_stream->weight);
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        x = torch::relu(fc1->forward(x));
+        x = torch::relu(fc2->forward(x));
+        x = torch::relu(fc3->forward(x));
+        auto value = value_stream->forward(x);
+        auto advantage = advantage_stream->forward(x);
+        return value + (advantage - advantage.mean(1, true));
+    }
+
+private:
+    torch::nn::Linear fc1{ nullptr }, fc2{ nullptr }, fc3{ nullptr }, value_stream{ nullptr }, advantage_stream{ nullptr };
+};
+TORCH_MODULE(DuelingAgentNet);
+class LSTMDuelingAgentNetImpl : public torch::nn::Module {
+public:
+    LSTMDuelingAgentNetImpl(int input_dim = 5, int output_dim = 2, int hidden_size = 128) {
+        // Feature extraction
+        fc1 = register_module("fc1", torch::nn::Linear(input_dim, 128));
+
+        // LSTM for sequence modeling
+        lstm = register_module("lstm", torch::nn::LSTM(
+            torch::nn::LSTMOptions(128, hidden_size).num_layers(1).batch_first(true)
+        ));
+
+        // Value and advantage streams
+        value_stream = register_module("value", torch::nn::Linear(hidden_size, 1));
+        advantage_stream = register_module("advantage", torch::nn::Linear(hidden_size, output_dim));
+
+        // Initialize hidden state
+        hidden = std::make_tuple(
+            torch::zeros({ 1, 1, hidden_size }),
+            torch::zeros({ 1, 1, hidden_size })
+        );
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        x = torch::relu(fc1->forward(x));
+        x = x.unsqueeze(0);  // Add sequence dimension
+
+        // Detach hidden state to prevent backprop through episodes
+        auto detached_hidden = std::make_tuple(
+            std::get<0>(hidden).detach(),
+            std::get<1>(hidden).detach()
+        );
+
+        auto lstm_out = lstm->forward(x, detached_hidden);
+        x = std::get<0>(lstm_out);
+        hidden = std::get<1>(lstm_out);  // Update hidden state
+
+        x = x.squeeze(0);  // Remove sequence dimension
+
+        auto value = value_stream->forward(x);
+        auto advantage = advantage_stream->forward(x);
+
+        return value + (advantage - advantage.mean(0, true));
+    }
+
+    void reset_hidden() {
+        hidden = std::make_tuple(
+            torch::zeros_like(std::get<0>(hidden)),
+            torch::zeros_like(std::get<1>(hidden))
+        );
+    }
+
+private:
+    torch::nn::Linear fc1{ nullptr }, value_stream{ nullptr }, advantage_stream{ nullptr };
+    torch::nn::LSTM lstm{ nullptr };
+    std::tuple<torch::Tensor, torch::Tensor> hidden;
+};
+TORCH_MODULE(LSTMDuelingAgentNet);
+class QLearningAgent {
+public:
+    ReplayBuffer replay_buffer_;
+
+    QLearningAgent(int state_dim, int action_dim, size_t replay_buffer_capacity, size_t batch_size)
+        : replay_buffer_(replay_buffer_capacity), batch_size_(batch_size) {
+        try {
+            // Use LSTM-based networks instead of regular DuelingAgent
+            network = std::make_shared<LSTMDuelingAgentNetImpl>(state_dim, action_dim);
+            target_network = std::make_shared<LSTMDuelingAgentNetImpl>(state_dim, action_dim);
+            optimizer = std::make_unique<torch::optim::Adam>(
+                network->parameters(),
+                torch::optim::AdamOptions(0.0005) // Lower learning rate for more stable learning
+                .weight_decay(0.0001)         // L2 regularization to prevent overfitting
+            );
+
+            copyNetworkParameters();  // Initial network parameter synchronization
+
+            DEBUG_PRINT("QLearningAgent initialized successfully");
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Error initializing QLearningAgent: " << e.what());
+            throw; // Re-throw to ensure initialization failure is detected
+        }
+    }
+
+    void addExperience(torch::Tensor state, torch::Tensor action, float reward, torch::Tensor next_state, bool done, float priority = 1.0f) {
+        replay_buffer_.add(state, action, reward, next_state, done, priority);
+    }
+
+    std::shared_ptr<LSTMDuelingAgentNetImpl> getNetwork() const {
+        return network;
+    }
+
+    torch::optim::Adam* getOptimizer() const {
+        return optimizer.get();
+    }
+
+    void pruneReplayBuffer(float keep_ratio) {
+        replay_buffer_.prune(keep_ratio);
+    }
+
+    torch::Tensor selectAction(torch::Tensor state, float epsilon) {
+        if (torch::rand({ 1 }).item<float>() < epsilon) {
+            // Random action
+            return torch::rand({ 2 }, torch::TensorOptions().dtype(torch::kFloat32)) * 2 - 1; // Random values between -1 and 1
+        }
+        else {
+            // Greedy action
+            network->eval();
+            torch::NoGradGuard no_grad;
+            auto q_values = network->forward(state);
+            auto action = q_values.argmax(0);
+            return action.to(torch::kFloat32);
+        }
+    }
+
+    void train() {
+        if (!replay_buffer_.can_sample(batch_size_)) {
+            return;
+        }
+
+        auto [states, actions, rewards, next_states, dones] = replay_buffer_.sample(batch_size_);
+
+        network->train();
+        optimizer->zero_grad();
+
+        // Ensure actions tensor is of type int64 and has the correct shape
+        actions = actions.to(torch::kInt64).view({ -1, 1 });
+
+        auto q_values = network->forward(states);
+        auto next_q_values = target_network->forward(next_states).detach();
+
+        auto q_value = q_values.gather(1, actions).squeeze(1);
+        auto next_q_value = std::get<0>(next_q_values.max(1)).detach();
+        auto expected_q_value = rewards + (1 - dones) * 0.99 * next_q_value;
+
+        auto loss = torch::nn::functional::mse_loss(q_value, expected_q_value);
+
+        loss.backward();
+        optimizer->step();
+    }
+
+    void updateTargetNetwork() {
+        copyNetworkParameters();
+    }
+
+private:
+    size_t batch_size_; // Declare batch_size_ as a member variable
+    std::shared_ptr<LSTMDuelingAgentNetImpl> network;
+    std::shared_ptr<LSTMDuelingAgentNetImpl> target_network;
+    std::unique_ptr<torch::optim::Adam> optimizer;
+
+    void copyNetworkParameters() {
+        torch::NoGradGuard no_grad;
+
+        // Access the parameters and buffers directly from the implementation modules
+        auto params = network->named_parameters();
+        auto buffers = network->named_buffers();
+
+        auto target_params = target_network->named_parameters();
+        auto target_buffers = target_network->named_buffers();
+
+        // Copy parameters
+        for (const auto& param : params) {
+            auto* target = target_params.find(param.key());
+            if (target != nullptr) {
+                target->copy_(param.value());
+            }
+        }
+
+        // Copy buffers (for batch normalization)
+        for (const auto& buffer : buffers) {
+            auto* target = target_buffers.find(buffer.key());
+            if (target != nullptr) {
+                target->copy_(buffer.value());
+            }
+        }
+    }
+};
+
+
+
+
+
+int main() {
+    try {
+        DEBUG_PRINT("Starting program...");
+
+        // Create window once outside the episode loop
+        const std::string window_name = "RL Environment";
+        cv::namedWindow(window_name, cv::WINDOW_AUTOSIZE);
+
+        size_t replay_buffer_capacity = 5000; // Increase capacity
+        size_t batch_size = 64; // Increase batch size
+
+        // Create agent with proper dimensions - Update to match new state dimension (5)
+        QLearningAgent agent(5, 2, replay_buffer_capacity, batch_size);
+
+        std::vector<cv::Point> agent_path;
+        int num_episodes = 500; // Increased from 100
+        float epsilon = 1.0;
+        float epsilon_min = 0.05; // Increase minimum exploration
+        float epsilon_decay = 0.99; // Slower decay for better exploration
+        float difficulty = 0.5; // Start with easier goals
+        std::vector<float> episode_rewards(num_episodes, 0.0f);
+        std::vector<int> episode_steps(num_episodes, 0);
+        int corner_visits = 0;
+        int total_steps = 0;
+
+        for (int episode = 0; episode < num_episodes; ++episode) {
+            Environment env(100, 100, difficulty);
+            agent_path.clear();
+            auto lstm_network = agent.getNetwork();
+            if (lstm_network) {
+                lstm_network->reset_hidden();
+            }
+
+            torch::Tensor state = env.getState();
+            float total_reward = 0;
+            int steps = 0;
+            corner_visits = 0;
+
+            env.render({}, window_name);
+
+            while (!env.isGoalReached() && steps < 200) {
+                torch::Tensor action = agent.selectAction(state, epsilon);
+                float reward = env.step(action);
+                torch::Tensor next_state = env.getState();
+
+                // Track corner visits for analysis
+                float norm_x = env.getAgentX() / 100.0f;
+                float norm_y = env.getAgentY() / 100.0f;
+
+                // Check for corner proximity
+                if ((norm_x < 0.15f && norm_y < 0.15f) ||
+                    (norm_x < 0.15f && norm_y > 0.85f) ||
+                    (norm_x > 0.85f && norm_y < 0.15f) ||
+                    (norm_x > 0.85f && norm_y > 0.85f)) {
+                    corner_visits++;
+
+                    // Apply direct anti-corner bias
+                    // The longer it stays in corners, the stronger the penalty
+                    float corner_penalty = std::min(5.0f, 0.5f * corner_visits);
+                    reward -= corner_penalty;
+                }
+
+                // Add specially crafted experiences for goal-directed behavior
+                agent.addExperience(state, action, reward, next_state, env.isGoalReached());
+
+                // Occasionally inject synthetic "ideal" experiences to counteract corner bias
+                if (steps % 10 == 0) {
+                    // Create an "ideal" action pointing directly to the goal
+                    float dx = env.getGoalX() - env.getAgentX();
+                    float dy = env.getGoalY() - env.getAgentY();
+                    float dist = std::sqrt(dx * dx + dy * dy);
+
+                    if (dist > 0) {
+                        float ideal_x = dx / dist;
+                        float ideal_y = dy / dist;
+
+                        torch::Tensor ideal_action = torch::tensor(
+                            { ideal_x, ideal_y },
+                            torch::TensorOptions().dtype(torch::kFloat32)
+                        );
+
+                        // Synthetic higher reward for the ideal action
+                        float synthetic_reward = 2.0f;
+
+                        // Add this synthetic experience to the buffer with high priority
+                        agent.addExperience(state, ideal_action, synthetic_reward, next_state, false, 2.0f);
+                    }
+                }
+
+                agent.train();  // Train from replay buffer
+
+                agent_path.push_back(cv::Point(static_cast<int>(env.getAgentX()),
+                    static_cast<int>(env.getAgentY())));
+                env.render(agent_path, window_name);
+
+                state = next_state;
+                total_reward += reward;
+                steps++;
+                total_steps++;
+            }
+
+            // Adaptive exploration & learning rate based on performance
+            if (env.isGoalReached()) {
+                // If goal reached with few corner visits, this was a good episode
+                if (corner_visits < 5) {
+                    // More aggressive decay for epsilon (less exploration needed)
+                    epsilon = std::max(epsilon_min, epsilon * 0.93f);
+
+                    // Reinforce successful strategies by updating target network sooner
+                    if (episode % 3 == 0) {
+                        agent.updateTargetNetwork();
+                    }
+
+                    // Increase difficulty faster after successful episodes
+                    if (steps < 80) {
+                        difficulty = std::min(1.0f, difficulty + 0.08f);
+                    }
+                }
+                else {
+                    // Goal reached but with many corner visits - mixed success
+                    epsilon = std::max(epsilon_min, epsilon * 0.95f);
+
+                    // Lower learning rate temporarily to stabilize learning
+                    for (auto& param_group : agent.getOptimizer()->param_groups()) {
+                        auto& options = static_cast<torch::optim::AdamOptions&>(param_group.options());
+                        options.lr(options.lr() * 0.98);
+                    }
+                }
+            }
+            else {
+                // Goal not reached - slow down decay to encourage more exploration
+                epsilon = std::max(epsilon_min, epsilon * 0.99f);
+
+                // Lower difficulty on repeated failures
+                if (episode > 10 && !env.isGoalReached()) {
+                    static int consecutive_failures = 0;
+                    consecutive_failures++;
+
+                    if (consecutive_failures >= 3) {
+                        difficulty = std::max(0.3f, difficulty - 0.05f);
+                        consecutive_failures = 0;
+
+                        // Reset the replay buffer partially to forget bad habits
+                        // Keep only 70% of newest experiences
+                        agent.pruneReplayBuffer(0.7f);
+                    }
+                }
+            }
+
+            // Update target network periodically, but adaptively
+            if (episode % 5 == 0) {
+                agent.updateTargetNetwork();
+            }
+
+            // Every 20 episodes, completely reset LSTM hidden state
+            // This prevents the model from getting stuck in learned patterns
+            if (episode % 20 == 0 && lstm_network) {
+                lstm_network->reset_hidden();
+            }
+
+            episode_rewards[episode] = total_reward;
+            episode_steps[episode] = steps;
+
+            DEBUG_PRINT("Episode " << episode << ": Steps=" << steps
+                << ", Total Reward=" << total_reward
+                << ", Epsilon=" << epsilon
+                << ", Difficulty=" << difficulty
+                << ", Corner visits=" << corner_visits);
+
+            cv::waitKey(500);
+        }
+
+        DEBUG_PRINT("Training complete! Press any key to exit...");
+        cv::waitKey(0);
+        cv::destroyAllWindows();
+    }
+    catch (const c10::Error& e) {
+        DEBUG_PRINT("LibTorch error: " << e.what());
+        return 1;
+    }
+    catch (const std::exception& e) {
+        DEBUG_PRINT("Standard exception: " << e.what());
+        return 1;
+    }
+    catch (...) {
+        DEBUG_PRINT("Unknown error occurred");
+        return 1;
+    }
+
+    return 0;
+}
+
+#include "replay_buffer.h"
+#include <numeric>
+
+ReplayBuffer::ReplayBuffer(size_t capacity) : capacity_(capacity), gen(std::random_device{}()) {}
+
+void ReplayBuffer::add(torch::Tensor state, torch::Tensor action, float reward, torch::Tensor next_state, bool done, float priority) {
+    if (buffer_.size() >= capacity_) {
+        buffer_.pop_front();
+        priorities_.erase(priorities_.begin());
+    }
+    buffer_.emplace_back(state, action, reward, next_state, done);
+    priorities_.push_back(priority); // Use the passed priority
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ReplayBuffer::sample(size_t batch_size) {
+    std::vector<size_t> indices(buffer_.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    // Sample based on priorities
+    std::discrete_distribution<size_t> dist(priorities_.begin(), priorities_.end());
+    std::vector<size_t> sampled_indices(batch_size);
+    std::generate(sampled_indices.begin(), sampled_indices.end(), [this, &dist]() { return dist(gen); });
+
+    std::vector<torch::Tensor> states, actions, rewards, next_states, dones;
+    for (size_t idx : sampled_indices) {
+        auto& elem = buffer_[idx];
+        states.push_back(std::get<0>(elem));
+        actions.push_back(std::get<1>(elem));
+        rewards.push_back(torch::tensor(std::get<2>(elem)));
+        next_states.push_back(std::get<3>(elem));
+        dones.push_back(torch::tensor(std::get<4>(elem) ? 1.0f : 0.0f));
+    }
+
+    return { torch::stack(states), torch::stack(actions), torch::stack(rewards),
+             torch::stack(next_states), torch::stack(dones) };
+}
+
+void ReplayBuffer::prune(float keep_ratio) {
+    if (keep_ratio <= 0.0f || keep_ratio >= 1.0f) return;
+
+    size_t new_size = static_cast<size_t>(buffer_.size() * keep_ratio);
+
+    while (buffer_.size() > new_size) {
+        buffer_.pop_front();
+        priorities_.erase(priorities_.begin());
+    }
+}
+
+bool ReplayBuffer::can_sample(size_t batch_size) const {
+    return buffer_.size() >= batch_size;
+}
+
+size_t ReplayBuffer::size() const {
+    return buffer_.size();
+}
+
+#ifndef REPLAY_BUFFER_H
+#define REPLAY_BUFFER_H
+
+#include <deque>
+#include <torch/torch.h>
+#include <vector>
+#include <random>
+#include <algorithm>
+#include <numeric>
+
+class ReplayBuffer {
+public:
+    explicit ReplayBuffer(size_t capacity);
+
+    void add(torch::Tensor state, torch::Tensor action, float reward, torch::Tensor next_state, bool done, float priority = 1.0f);
+
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> sample(size_t batch_size);
+
+    bool can_sample(size_t batch_size) const;
+    size_t size() const;
+    void prune(float keep_ratio);  // New method to prune buffer
+
+private:
+    size_t capacity_;
+    std::deque<std::tuple<torch::Tensor, torch::Tensor, float, torch::Tensor, bool>> buffer_;
+    std::vector<float> priorities_;
+    std::mt19937 gen;
+};
+
+#endif // REPLAY_BUFFER_H
