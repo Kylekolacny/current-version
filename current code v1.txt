@@ -1,0 +1,536 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <random> 
+#include <cmath>
+#include <vector>
+// Prevent conflicts between Qt and LibTorch
+#undef slots
+#include <torch/torch.h>
+#include <torch/script.h>
+#define slots Q_SLOTS
+
+// Enable console output flushing
+#define DEBUG_PRINT(x) do { std::cout << x << std::endl; std::cout.flush(); } while(0) // 
+
+class ConvReluBnImpl : public torch::nn::Module {
+public:
+    ConvReluBnImpl(int input_channel = 3, int output_channel = 64, int kernel_size = 3);
+    torch::Tensor forward(torch::Tensor x);
+private:
+    // Declare layers
+    torch::nn::Conv2d conv{ nullptr };
+    torch::nn::BatchNorm2d bn{ nullptr };
+};
+TORCH_MODULE(ConvReluBn);
+
+ConvReluBnImpl::ConvReluBnImpl(int input_channel, int output_channel, int kernel_size) {
+    conv = register_module("conv", torch::nn::Conv2d(
+        torch::nn::Conv2dOptions(input_channel, output_channel, kernel_size).padding(1)));
+    bn = register_module("bn", torch::nn::BatchNorm2d(output_channel));
+}
+
+torch::Tensor ConvReluBnImpl::forward(torch::Tensor x) {
+    x = torch::relu(conv->forward(x));
+    x = bn(x);
+    return x;
+}
+
+class Environment {
+public:
+   
+    void render(const std::vector<cv::Point>& path = {}, const std::string& window_name = "RL Environment") const
+    {
+        const int scale = 5;  // Scale up for better visibility
+        const int width = width_ * scale;
+        const int height = height_ * scale;
+
+        // Create a white background image
+        cv::Mat image = cv::Mat::ones(height, width, CV_8UC3) * 255;
+
+        // Draw path history (red line)
+        if (!path.empty()) {
+            std::vector<cv::Point> scaled_path;
+            for (const auto& pt : path) {
+                scaled_path.push_back(cv::Point(pt.x * scale, pt.y * scale));
+            }
+            cv::polylines(image, std::vector<std::vector<cv::Point>>{scaled_path}, false, cv::Scalar(0, 0, 255), 2);
+        }
+
+        // Draw the goal (green circle)
+        cv::circle(image,
+            cv::Point(static_cast<int>(goal_x_ * scale), static_cast<int>(goal_y_ * scale)),
+            10, cv::Scalar(0, 255, 0), cv::FILLED);
+
+        // Draw the agent (blue circle)
+        cv::circle(image,
+            cv::Point(static_cast<int>(agent_x_ * scale), static_cast<int>(agent_y_ * scale)),
+            10, cv::Scalar(255, 0, 0), cv::FILLED);
+
+        // Add text to show distance to goal
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        double distance = std::sqrt(dx * dx + dy * dy);
+        cv::putText(image, "Distance: " + std::to_string(distance),
+            cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+
+        // Display the image
+        cv::imshow(window_name, image);
+
+        // Delay to make the visualization visible
+        cv::waitKey(10);
+    }
+
+    // Add getters for accessing agent and goal positions
+    float getAgentX() const { return agent_x_; }
+    float getAgentY() const { return agent_y_; }
+    float getGoalX() const { return goal_x_; }
+    float getGoalY() const { return goal_y_; }
+
+    Environment(int width = 100, int height = 100)
+        : width_(width), height_(height),
+        agent_x_(width / 2), agent_y_(height / 2) {
+
+        // Use a proper random number generator
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> distrib_w(0, width - 1);
+        std::uniform_int_distribution<> distrib_h(0, height - 1);
+
+        // Generate goal position
+        do {
+            goal_x_ = distrib_w(gen);
+            goal_y_ = distrib_h(gen);
+
+            // Calculate distance between agent and goal
+            double dx = goal_x_ - agent_x_;
+            double dy = goal_y_ - agent_y_;
+            double distance = std::sqrt(dx * dx + dy * dy);
+
+            // Ensure a minimum distance (e.g., 30% of the environment diagonal)
+            double min_distance = 0.3 * std::sqrt(width * width + height * height);
+
+            // If distance is sufficient, break the loop
+            if (distance >= min_distance) break;
+
+        } while (true);
+
+        DEBUG_PRINT("Environment created: Agent at (" << agent_x_ << ", " << agent_y_ <<
+            "), goal at (" << goal_x_ << ", " << goal_y_ << ")");
+    }
+
+    // Compute state: distance and angle to goal
+    // Modify the Environment::getState() method:
+    torch::Tensor getState() {
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+
+        // Distance to goal
+        double distance = std::sqrt(dx * dx + dy * dy);
+
+        // Use sin and cos components of the angle instead of raw angle
+        double angle = std::atan2(dy, dx);
+        double sin_angle = std::sin(angle);
+        double cos_angle = std::cos(angle);
+
+        // Return a 3-element tensor with distance, sin, and cos components
+        return torch::tensor({ distance, sin_angle, cos_angle },
+            torch::TensorOptions().dtype(torch::kFloat32).requires_grad(true));
+    }
+
+
+    // Apply agent's action and return reward
+    float step(torch::Tensor action) {
+        try {
+            // Verify tensor is accessible and detach if needed
+            if (!action.defined() || action.numel() < 2) {
+                DEBUG_PRINT("Warning: Invalid action tensor");
+                return -100.0f;  // Penalty for invalid action
+            }
+
+            // Detach tensor to prevent gradient issues
+            action = action.detach();
+
+            float move_x = action[0].item<float>();
+            float move_y = action[1].item<float>();
+
+            DEBUG_PRINT("Action selected: [" << move_x << ", " << move_y << "]");
+
+            // Compute initial distance to goal
+            double dx = goal_x_ - agent_x_;
+            double dy = goal_y_ - agent_y_;
+            double prev_distance = std::sqrt(dx * dx + dy * dy);
+
+            // Update agent position
+            agent_x_ += move_x * 5;
+            agent_y_ += move_y * 5;
+
+            // Bound check
+            agent_x_ = std::max(0.0f, std::min(static_cast<float>(width_), agent_x_));
+            agent_y_ = std::max(0.0f, std::min(static_cast<float>(height_), agent_y_));
+
+            // Compute new distance to goal
+            dx = goal_x_ - agent_x_;
+            dy = goal_y_ - agent_y_;
+            double distance = std::sqrt(dx * dx + dy * dy);
+
+            // Reward is negative distance (closer = better)
+            float reward = prev_distance - distance;
+
+            // Add bonus for reaching the goal
+            if (distance < 5.0) {
+                reward += 50.0f;
+            }
+            bool hit_boundary = false;
+            if (agent_x_ == 0 || agent_x_ == width_ || agent_y_ == 0 || agent_y_ == height_) {
+                reward -= 1.0f;  // Small penalty for hitting walls
+                hit_boundary = true;
+            }
+
+            DEBUG_PRINT("Step: reward=" << reward << (hit_boundary ? " (hit boundary)" : ""));
+
+            return reward;
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in step: " << e.what());
+            return -100.0f;  // Return penalty on error
+        }
+    }
+
+    // Check if goal is reached
+    bool isGoalReached() {
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        return std::sqrt(dx * dx + dy * dy) < 5.0;
+    }
+
+private:
+    int width_, height_;
+    float agent_x_, agent_y_;
+    float goal_x_, goal_y_;
+};
+
+// Neural Network Agent
+class AgentNet : public torch::nn::Module {
+public:
+    AgentNet() {
+    try {
+        fc1 = register_module("fc1", torch::nn::Linear(3, 32));  // More neurons
+        fc2 = register_module("fc2", torch::nn::Linear(32, 32));
+        fc3 = register_module("fc3", torch::nn::Linear(32, 2));
+        
+        // Initialize weights using Xavier/Glorot initialization
+        torch::nn::init::xavier_uniform_(fc1->weight);
+        torch::nn::init::xavier_uniform_(fc2->weight);
+        torch::nn::init::xavier_uniform_(fc3->weight);
+        
+        // Initialize biases to zero
+        torch::nn::init::zeros_(fc1->bias);
+        torch::nn::init::zeros_(fc2->bias);
+        torch::nn::init::zeros_(fc3->bias);
+        
+        DEBUG_PRINT("AgentNet initialized successfully with Xavier weights");
+    }
+    catch (const std::exception& e) {
+        DEBUG_PRINT("Error initializing AgentNet: " << e.what());
+    }
+}
+
+    torch::Tensor forward(torch::Tensor x) {
+        try {
+            // Ensure input tensor requires gradients
+            if (!x.requires_grad()) {
+                x = x.clone().requires_grad_(true);
+            }
+
+            x = torch::relu(fc1->forward(x));
+            x = torch::relu(fc2->forward(x));
+            x = fc3->forward(x);
+
+            // Use tanh activation to constrain outputs between -1 and 1
+            x = torch::tanh(x);
+
+            return x;
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in forward pass: " << e.what());
+            // Return a default action in case of error
+            return torch::zeros({ 2 }, torch::TensorOptions().requires_grad(true));
+        }
+    }
+
+    // Add state_dict method
+    torch::OrderedDict<std::string, torch::Tensor> state_dict() const {
+        return this->named_parameters();
+    }
+
+    // Add load_state_dict method
+    void load_state_dict(const torch::OrderedDict<std::string, torch::Tensor>& state_dict) {
+        for (const auto& item : state_dict) {
+            this->named_parameters()[item.key()].copy_(item.value());
+        }
+    }
+
+private:
+    torch::nn::Linear fc1{ nullptr }, fc2{ nullptr }, fc3{ nullptr };
+};
+
+// Simple Q-Learning Agent
+class QLearningAgent {
+public:
+    QLearningAgent(int state_dim, int action_dim) {
+        try {
+            network = std::make_shared<AgentNet>();
+            target_network = std::make_shared<AgentNet>();
+            optimizer = std::make_unique<torch::optim::Adam>(
+                network->parameters(), torch::optim::AdamOptions(0.001));
+
+            // Initial synchronization of networks
+            copyNetworkParameters();
+
+            DEBUG_PRINT("QLearningAgent initialized successfully");
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Error initializing QLearningAgent: " << e.what());
+        }
+    }
+
+    torch::Tensor selectAction(torch::Tensor state, float epsilon) {
+        try {
+            // Ensure state requires gradients
+            if (!state.requires_grad()) {
+                state = state.clone().requires_grad_(true);
+            }
+
+            // Epsilon-greedy action selection
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_real_distribution<> dis(0.0, 1.0);
+
+            if (dis(gen) < epsilon) {
+                // Generate truly random actions between -1 and 1
+                std::uniform_real_distribution<float> action_dist(-1.0, 1.0);
+                float rand_x = action_dist(gen);
+                float rand_y = action_dist(gen);
+                return torch::tensor({ rand_x, rand_y },
+                    torch::TensorOptions().dtype(torch::kFloat32).requires_grad(true));
+            }
+
+            // Ensure state is properly shaped for network
+            torch::NoGradGuard no_grad;
+            auto action = network->forward(state);
+
+            // Clamp actions to be within valid range
+            action = torch::clamp(action, -1.0, 1.0);
+            return action;
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in selectAction: " << e.what());
+            // Return a default action in case of error
+            return torch::zeros({ 2 }, torch::TensorOptions().requires_grad(true));
+        }
+    }
+
+    void train(torch::Tensor state, torch::Tensor action, float reward, torch::Tensor next_state) {
+        try {
+            // Ensure tensors require gradients
+            if (!state.requires_grad())
+                state = state.clone().requires_grad_(true);
+            if (!next_state.requires_grad())
+                next_state = next_state.clone().requires_grad_(true);
+
+            // Create a differentiable reward tensor
+            torch::Tensor reward_tensor = torch::tensor(reward,
+                torch::TensorOptions().dtype(torch::kFloat32).requires_grad(true));
+
+            // Get the predicted action values from the network for the current state
+            torch::Tensor current_q_values = network->forward(state);
+
+            // Get the predicted action values from the target network for the next state
+            torch::Tensor next_q_values = target_network->forward(next_state);
+
+            // Get the maximum Q-value for the next state
+            torch::Tensor next_max_q = std::get<0>(next_q_values.max(0));
+
+            // Calculate the target Q-value using the Bellman equation
+            // We start with the current predictions
+            torch::Tensor target_q_values = current_q_values.clone();
+
+            // Update just the specific action that was taken (both x and y components)
+            target_q_values[0] = reward_tensor + 0.99 * next_max_q[0];  // x-component
+            target_q_values[1] = reward_tensor + 0.99 * next_max_q[1];  // y-component
+
+            // Compute loss
+            torch::Tensor loss = torch::mse_loss(current_q_values, target_q_values);
+
+            // Zero gradients, backpropagate, and optimize
+            optimizer->zero_grad();
+            loss.backward();
+            optimizer->step();
+
+            DEBUG_PRINT("Training step completed. Loss: " << loss.item<float>());
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in train: " << e.what());
+        }
+    }
+
+
+    void updateTargetNetwork() {
+        try {
+            copyNetworkParameters();
+            DEBUG_PRINT("Target network updated");
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Exception in updateTargetNetwork: " << e.what());
+        }
+    }
+
+private:
+    std::shared_ptr<AgentNet> network;
+    std::shared_ptr<AgentNet> target_network;
+    std::unique_ptr<torch::optim::Adam> optimizer;
+
+    void copyNetworkParameters() {
+        torch::NoGradGuard no_grad; // Disable gradient tracking during parameter copying
+
+        auto params = network->named_parameters();
+        auto buffers = network->named_buffers();
+
+        auto target_params = target_network->named_parameters();
+        auto target_buffers = target_network->named_buffers();
+
+        for (auto& val : params) {
+            auto name = val.key();
+            auto* target = target_params.find(name);
+            if (target != nullptr) {
+                target->copy_(val.value());
+            }
+        }
+
+        for (auto& val : buffers) {
+            auto name = val.key();
+            auto* target = target_buffers.find(name);
+            if (target != nullptr) {
+                target->copy_(val.value());
+            }
+        }
+    }
+
+};
+
+int main() {
+    try {
+        DEBUG_PRINT("Starting program...");
+
+        // Set random seed
+        std::random_device rd;
+        std::srand(rd());
+
+        // Create environment and agent
+        DEBUG_PRINT("Creating environment and agent...");
+
+        try {
+            Environment env;
+            QLearningAgent agent(2, 2);  // 2D state, 2D action space
+
+            // Create a window for visualization
+            const std::string window_name = "RL Environment";
+            cv::namedWindow(window_name, cv::WINDOW_AUTOSIZE);
+
+            // Option: create a record of agent's path for visualization
+            std::vector<cv::Point> agent_path;
+
+            // Training loop
+            int num_episodes = 100;  // Reduced from 1000 for testing
+            float epsilon = 1.0;  // Exploration rate
+
+            for (int episode = 0; episode < num_episodes; ++episode) {
+                // Reset environment
+                Environment new_env;
+                env = new_env;
+
+                // Clear path history for new episode
+                agent_path.clear();
+
+                // Initial state with requires_grad
+                torch::Tensor state = env.getState();
+
+                float total_reward = 0;
+                int steps = 0;
+
+                // Visualize initial state
+                env.render({}, window_name);
+
+
+                while (!env.isGoalReached() && steps < 100) {  // Reduced from 200 for testing
+                    // Select and apply action
+                    torch::Tensor action = agent.selectAction(state, epsilon);
+                    float reward = env.step(action);
+
+                    // Get next state with requires_grad
+                    torch::Tensor next_state = env.getState();
+
+                    // Train agent
+                    agent.train(state, action, reward, next_state);
+
+                    // Record path for visualization
+                    agent_path.push_back(cv::Point(
+                        static_cast<int>(env.getAgentX()),
+                        static_cast<int>(env.getAgentY())
+                    ));
+
+                    // Render the environment after each step
+                    env.render(agent_path, window_name);
+
+                    // Update state
+                    state = next_state;
+                    total_reward += reward;
+                    steps++;
+                }
+
+                // Decay epsilon
+                epsilon = std::max(0.05f, epsilon * 0.995f);
+
+                // Periodically update target network
+                if (episode % 5 == 0) {  // Changed from 10 to 5
+                    agent.updateTargetNetwork();
+                }
+
+                // Print progress (now with buffer flushing)
+                DEBUG_PRINT("Episode " << episode
+                    << ": Steps=" << steps
+                    << ", Total Reward=" << total_reward
+                    << ", Epsilon=" << epsilon);
+
+                // Pause briefly between episodes to see final state
+                cv::waitKey(500);
+            }
+
+            // Wait for user to close the window when training is finished
+            DEBUG_PRINT("Training complete! Press any key to exit...");
+            cv::waitKey(0);
+            cv::destroyAllWindows();
+        }
+        catch (const c10::Error& e) {
+            DEBUG_PRINT("LibTorch error: " << e.what());
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Standard exception: " << e.what());
+        }
+        catch (...) {
+            DEBUG_PRINT("Unknown error occurred");
+        }
+
+        DEBUG_PRINT("Program completed successfully");
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
+    }
+    catch (...) {
+        std::cerr << "Unknown fatal error occurred" << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
