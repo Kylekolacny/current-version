@@ -1,0 +1,430 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <random> 
+#include <cmath>
+#include <vector>
+#include <deque>
+#include "replay_buffer.h"
+#undef slots
+#include <torch/torch.h>
+#include <torch/script.h>
+#define slots Q_SLOTS
+
+#define DEBUG_PRINT(x) do { std::cout << x << std::endl; std::cout.flush(); } while(0)
+
+class ConvReluBnImpl : public torch::nn::Module {
+public:
+    ConvReluBnImpl(int input_channel = 3, int output_channel = 64, int kernel_size = 3);
+    torch::Tensor forward(torch::Tensor x);
+private:
+    torch::nn::Conv2d conv{ nullptr };
+    torch::nn::BatchNorm2d bn{ nullptr };
+};
+TORCH_MODULE(ConvReluBn);
+
+ConvReluBnImpl::ConvReluBnImpl(int input_channel, int output_channel, int kernel_size) {
+    conv = register_module("conv", torch::nn::Conv2d(
+        torch::nn::Conv2dOptions(input_channel, output_channel, kernel_size).padding(1)));
+    bn = register_module("bn", torch::nn::BatchNorm2d(output_channel));
+}
+
+torch::Tensor ConvReluBnImpl::forward(torch::Tensor x) {
+    x = torch::relu(conv->forward(x));
+    x = bn(x);
+    return x;
+}
+
+class Environment {
+public:
+    void render(const std::vector<cv::Point>& path = {}, const std::string& window_name = "RL Environment") const {
+        const int scale = 5;
+        const int width = width_ * scale;
+        const int height = height_ * scale;
+
+        cv::Mat image = cv::Mat::ones(height, width, CV_8UC3) * 255;
+
+        if (!path.empty()) {
+            std::vector<cv::Point> scaled_path;
+            for (const auto& pt : path) {
+                scaled_path.push_back(cv::Point(pt.x * scale, pt.y * scale));
+            }
+            cv::polylines(image, std::vector<std::vector<cv::Point>>{scaled_path}, false, cv::Scalar(0, 0, 255), 2);
+        }
+
+        cv::circle(image,
+            cv::Point(static_cast<int>(goal_x_ * scale), static_cast<int>(goal_y_ * scale)),
+            10, cv::Scalar(0, 255, 0), cv::FILLED);
+
+        cv::circle(image,
+            cv::Point(static_cast<int>(agent_x_ * scale), static_cast<int>(agent_y_ * scale)),
+            10, cv::Scalar(255, 0, 0), cv::FILLED);
+
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        double distance = std::sqrt(dx * dx + dy * dy);
+        cv::putText(image, "Distance: " + std::to_string(distance),
+            cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
+
+        cv::imshow(window_name, image);
+        cv::waitKey(10);
+    }
+
+    float getAgentX() const { return agent_x_; }
+    float getAgentY() const { return agent_y_; }
+    float getGoalX() const { return goal_x_; }
+    float getGoalY() const { return goal_y_; }
+
+    Environment(int width = 100, int height = 100)
+        : width_(width), height_(height),
+        agent_x_(width / 2), agent_y_(height / 2) {
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> distrib_w(0, width - 1);
+        std::uniform_int_distribution<> distrib_h(0, height - 1);
+
+        do {
+            goal_x_ = distrib_w(gen);
+            goal_y_ = distrib_h(gen);
+
+            double dx = goal_x_ - agent_x_;
+            double dy = goal_y_ - agent_y_;
+            double distance = std::sqrt(dx * dx + dy * dy);
+
+            double min_distance = 0.3 * std::sqrt(width * width + height * height);
+
+            if (distance >= min_distance) break;
+
+        } while (true);
+
+        DEBUG_PRINT("Environment created: Agent at (" << agent_x_ << ", " << agent_y_ <<
+            "), goal at (" << goal_x_ << ", " << goal_y_ << ")");
+    }
+
+    torch::Tensor getState() {
+        auto state = torch::empty({ 3 }, torch::TensorOptions().dtype(torch::kFloat32));
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        double distance = std::sqrt(dx * dx + dy * dy);
+        double angle = std::atan2(dy, dx);
+        state[0] = distance;
+        state[1] = std::sin(angle);
+        state[2] = std::cos(angle);
+        return state.detach().requires_grad_(true);
+    }
+
+    float step(torch::Tensor action) {
+        if (!action.defined() || action.numel() < 2) {
+            DEBUG_PRINT("Warning: Invalid action tensor");
+            return -100.0f;
+        }
+
+        action = action.detach();
+
+        float move_x = action[0].item<float>();
+        float move_y = action[1].item<float>();
+
+        DEBUG_PRINT("Action selected: [" << move_x << ", " << move_y << "]");
+
+        double prev_dx = goal_x_ - agent_x_;
+        double prev_dy = goal_y_ - agent_y_;
+        double prev_distance = std::sqrt(prev_dx * prev_dx + prev_dy * prev_dy);
+
+        agent_x_ += move_x * 5;
+        agent_y_ += move_y * 5;
+
+        agent_x_ = std::max(0.0f, std::min(static_cast<float>(width_), agent_x_));
+        agent_y_ = std::max(0.0f, std::min(static_cast<float>(height_), agent_y_));
+
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        double distance = std::sqrt(dx * dx + dy * dy);
+
+        float reward = prev_distance - distance;
+
+        if (distance < 5.0) {
+            reward += 50.0f;
+        }
+
+        bool hit_boundary = false;
+        if (agent_x_ == 0 || agent_x_ == width_ || agent_y_ == 0 || agent_y_ == height_) {
+            reward -= 1.0f;
+            hit_boundary = true;
+        }
+
+        DEBUG_PRINT("Step: reward=" << reward << (hit_boundary ? " (hit boundary)" : ""));
+
+        return reward;
+    }
+
+    bool isGoalReached() {
+        double dx = goal_x_ - agent_x_;
+        double dy = goal_y_ - agent_y_;
+        return std::sqrt(dx * dx + dy * dy) < 5.0;
+    }
+
+private:
+    int width_, height_;
+    float agent_x_, agent_y_;
+    float goal_x_, goal_y_;
+};
+
+
+ReplayBuffer::ReplayBuffer(size_t capacity) : capacity_(capacity) {}
+std::mt19937 gen{ std::random_device{}() };
+void ReplayBuffer::add(torch::Tensor state, torch::Tensor action, float reward, torch::Tensor next_state, bool done) {
+    if (buffer_.size() >= capacity_) {
+        buffer_.pop_front();
+        priorities_.erase(priorities_.begin());
+    }
+    buffer_.emplace_back(state, action, reward, next_state, done);
+    priorities_.push_back(1.0f); // Assign a high priority to new experiences
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ReplayBuffer::sample(size_t batch_size) {
+    std::vector<size_t> indices(buffer_.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    // Sample based on priorities
+    std::discrete_distribution<size_t> dist(priorities_.begin(), priorities_.end());
+    std::vector<size_t> sampled_indices(batch_size);
+    std::generate(sampled_indices.begin(), sampled_indices.end(), [&dist, &gen]() { return dist(gen); });
+
+    std::vector<torch::Tensor> states, actions, rewards, next_states, dones;
+    for (size_t idx : sampled_indices) {
+        auto& [state, action, reward, next_state, done] = buffer_[idx];
+        states.push_back(state);
+        actions.push_back(action);
+        rewards.push_back(torch::tensor(reward));
+        next_states.push_back(next_state);
+        dones.push_back(torch::tensor(done));
+    }
+
+    return { torch::stack(states), torch::stack(actions), torch::stack(rewards), torch::stack(next_states), torch::stack(dones) };
+}
+
+bool ReplayBuffer::can_sample(size_t batch_size) const {
+    return buffer_.size() >= batch_size;
+}
+
+size_t ReplayBuffer::size() const {
+    return buffer_.size();
+}
+class DuelingAgentNetImpl : public torch::nn::Module {
+public:
+    DuelingAgentNetImpl(int input_dim = 3, int output_dim = 2) {
+        // Define the network layers
+        fc1 = register_module("fc1", torch::nn::Linear(input_dim, 128));
+        fc2 = register_module("fc2", torch::nn::Linear(128, 128));
+        value_stream = register_module("value_stream", torch::nn::Linear(128, 1));
+        advantage_stream = register_module("advantage_stream", torch::nn::Linear(128, output_dim));
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        x = torch::relu(fc1->forward(x));
+        x = torch::relu(fc2->forward(x));
+        auto value = value_stream->forward(x);
+        auto advantage = advantage_stream->forward(x);
+        return value + (advantage - advantage.mean(1, true));
+    }
+
+private:
+    torch::nn::Linear fc1{ nullptr }, fc2{ nullptr }, value_stream{ nullptr }, advantage_stream{ nullptr };
+};
+TORCH_MODULE(DuelingAgentNet);
+class QLearningAgent {
+public:
+    ReplayBuffer replay_buffer_;
+
+    QLearningAgent(int state_dim, int action_dim, size_t replay_buffer_capacity, size_t batch_size)
+        : replay_buffer_(replay_buffer_capacity), batch_size_(batch_size) {
+        try {
+            network = std::make_shared<DuelingAgentNet>();
+            target_network = std::make_shared<DuelingAgentNet>();
+            optimizer = std::make_unique<torch::optim::Adam>(network->parameters(), torch::optim::AdamOptions(0.001));
+
+            copyNetworkParameters();  // Initial network parameter synchronization
+
+            DEBUG_PRINT("QLearningAgent initialized successfully");
+        }
+        catch (const std::exception& e) {
+            DEBUG_PRINT("Error initializing QLearningAgent: " << e.what());
+        }
+    }
+
+    torch::Tensor selectAction(torch::Tensor state, float epsilon) {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<> dis(0.0, 1.0);
+
+        if (dis(gen) < epsilon) {
+            std::uniform_real_distribution<float> action_dist(-1.0, 1.0);
+            return torch::tensor({ action_dist(gen), action_dist(gen) },
+                torch::TensorOptions().dtype(torch::kFloat32));
+        }
+
+        torch::NoGradGuard no_grad;
+        return torch::clamp(network->forward(state), -1.0, 1.0);
+    }
+
+    void train() {
+        if (replay_buffer_.size() < batch_size_) return;
+
+        auto batch = replay_buffer_.sample(batch_size_);
+        auto states = std::get<0>(batch);
+        auto actions = std::get<1>(batch);
+        auto rewards = std::get<2>(batch);
+        auto next_states = std::get<3>(batch);
+        auto dones = std::get<4>(batch);
+
+        torch::Tensor q_values = network->forward(states);
+        torch::Tensor next_q_values = target_network->forward(next_states);
+
+        torch::Tensor target_q_values = rewards.clone();
+
+        for (size_t i = 0; i < batch_size_; ++i) {
+            float reward = rewards[i].item<float>();
+            bool done = dones[i].item<bool>();
+
+            float max_next_q = done ? 0.0f : next_q_values[i].max().item<float>();
+            target_q_values[i] += 0.99 * max_next_q;  // Gamma = 0.99
+        }
+
+        torch::Tensor loss = torch::mse_loss(q_values, target_q_values.detach());
+
+        optimizer->zero_grad();
+        loss.backward();
+        optimizer->step();
+    }
+
+    void addExperience(torch::Tensor state, torch::Tensor action, float reward,
+        torch::Tensor next_state, bool done) {
+        replay_buffer_.add(state, action, reward, next_state, done);
+    }
+
+    void updateTargetNetwork() {
+        copyNetworkParameters();
+    }
+
+private:
+    std::shared_ptr<DuelingAgentNet> network;
+    std::shared_ptr<DuelingAgentNet> target_network;
+    std::unique_ptr<torch::optim::Adam> optimizer;
+    size_t batch_size_;
+
+    void copyNetworkParameters() {
+        torch::NoGradGuard no_grad;
+
+        // Explicitly create named parameter and buffer holders
+        auto params = network->named_parameters(false);  // false to include non-persistent parameters
+        auto target_params = target_network->named_parameters(false);
+
+        for (const auto& param : params) {
+            const std::string& name = param.key();
+
+            // Find corresponding parameter in target network
+            auto target_param = target_params.find(name);
+            if (target_param != target_params.end()) {
+                // Directly copy parameter values
+                target_param->value().copy_(param.value());
+            }
+        }
+
+        // If you want to copy buffers (like batch norm running means/vars), use similar approach
+        auto buffers = network->named_buffers(false);
+        auto target_buffers = target_network->named_buffers(false);
+
+        for (const auto& buffer : buffers) {
+            const std::string& name = buffer.key();
+
+            auto target_buffer = target_buffers.find(name);
+            if (target_buffer != target_buffers.end()) {
+                target_buffer->value().copy_(buffer.value());
+            }
+        }
+    }
+};
+
+int main() {
+    try {
+        DEBUG_PRINT("Starting program...");
+        std::random_device rd;
+        std::srand(rd());
+
+        size_t replay_buffer_capacity = 1000;
+        size_t batch_size = 32;
+
+        // Create only one agent
+        QLearningAgent agent(3, 2, replay_buffer_capacity, batch_size);
+        Environment env;
+
+        const std::string window_name = "RL Environment";
+        cv::namedWindow(window_name, cv::WINDOW_AUTOSIZE);
+
+        std::vector<cv::Point> agent_path;
+        int num_episodes = 100;
+        float epsilon = 1.0;
+        float epsilon_min = 0.01;
+        float epsilon_decay = 0.995;
+
+        for (int episode = 0; episode < num_episodes; ++episode) {
+            env = Environment();  // Reset environment for each episode
+            agent_path.clear();
+
+            torch::Tensor state = env.getState();
+            float total_reward = 0;
+            int steps = 0;
+
+            env.render({}, window_name);
+
+            while (!env.isGoalReached() && steps < 200) {
+                torch::Tensor action = agent.selectAction(state, epsilon);
+                float reward = env.step(action);
+                torch::Tensor next_state = env.getState();
+
+                agent.addExperience(state, action, reward, next_state, env.isGoalReached());
+                agent.train();  // Train from replay buffer
+
+                agent_path.push_back(cv::Point(static_cast<int>(env.getAgentX()),
+                    static_cast<int>(env.getAgentY())));
+                env.render(agent_path, window_name);
+
+                state = next_state;
+                total_reward += reward;
+                steps++;
+            }
+
+            // More gradual epsilon decay
+            epsilon = std::max(epsilon_min, epsilon * epsilon_decay);
+
+            // Update target network periodically
+            if (episode % 10 == 0) {
+                agent.updateTargetNetwork();
+            }
+
+            DEBUG_PRINT("Episode " << episode << ": Steps=" << steps
+                << ", Total Reward=" << total_reward
+                << ", Epsilon=" << epsilon);
+
+            cv::waitKey(500);
+        }
+
+        DEBUG_PRINT("Training complete! Press any key to exit...");
+        cv::waitKey(0);
+        cv::destroyAllWindows();
+    }
+    catch (const c10::Error& e) {
+        DEBUG_PRINT("LibTorch error: " << e.what());
+        return 1;
+    }
+    catch (const std::exception& e) {
+        DEBUG_PRINT("Standard exception: " << e.what());
+        return 1;
+    }
+    catch (...) {
+        DEBUG_PRINT("Unknown error occurred");
+        return 1;
+    }
+
+    return 0;
+}
